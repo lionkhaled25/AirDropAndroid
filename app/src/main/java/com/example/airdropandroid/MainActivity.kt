@@ -7,11 +7,14 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import fi.iki.elonen.NanoHTTPD
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 class MainActivity : AppCompatActivity() {
 
@@ -24,8 +27,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val layout = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(60, 60, 60, 60)
         }
 
@@ -34,7 +37,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 20f
         }
         infoText = TextView(this).apply {
-            text = "اضغط على الزر لإنشاء شبكة الواي فاي المحلية للسيرفر."
+            text = "اضغط على الزر لإنشاء شبكة الواي فاي المحلية للسيرفر.\n(لازم تكون خدمة الموقع GPS شغالة)"
             textSize = 16f
             setPadding(0, 30, 0, 30)
         }
@@ -59,51 +62,88 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
-        val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        val missing = permissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
         if (missing.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun readCredentials(r: WifiManager.LocalOnlyHotspotReservation?): Pair<String, String> {
+        if (r == null) return Pair("Unknown", "Unknown")
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val c = r.softApConfiguration
+            Pair(c.ssid ?: "Unknown", c.passphrase ?: "Unknown")
+        } else {
+            val c = r.wifiConfiguration
+            Pair(c?.SSID ?: "Unknown", c?.preSharedKey ?: "Unknown")
+        }
+    }
+
+    // عنوان الـ IP الحقيقي للهوتسبوت مش دايماً 192.168.43.1
+    private fun getLocalIps(): List<String> {
+        val result = mutableListOf<String>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return result
+            for (ni in interfaces) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (addr in ni.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        addr.hostAddress?.let { result.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return result
+    }
+
     private fun startHotspotAndServer() {
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             statusText.text = "الحالة: يرجى منح إذن الموقع أولاً"
+            checkPermissions()
             return
         }
 
-        wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
-            override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation?) {
-                super.onStarted(reservation)
-                hotspotReservation = reservation
-                val ssid = reservation?.wifiConfiguration?.SSID ?: "Unknown"
-                val password = reservation?.wifiConfiguration?.preSharedKey ?: "Unknown"
+        try {
+            wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+                override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation?) {
+                    super.onStarted(reservation)
+                    hotspotReservation = reservation
+                    val (ssid, password) = readCredentials(reservation)
 
-                startWebServer()
+                    startWebServer()
 
-                statusText.text = "الحالة: شغال بنجاح! 🚀"
-                infoText.text = """
-                    قم بالتوصيل من الأيباد:
-                    اسم الشبكة: $ssid
-                    كلمة السر: $password
-                    
-                    افتح Safari واكتب العنوان:
-                    http://192.168.43.1:8080
-                """.trimIndent()
-            }
+                    val ips = getLocalIps().joinToString("\n") { "http://$it:8080" }
 
-            override fun onFailed(reason: Int) {
-                super.onFailed(reason)
-                statusText.text = "فشل تشغيل الشبكة: $reason"
-            }
-        }, null)
+                    statusText.text = "الحالة: شغال بنجاح! 🚀"
+                    infoText.text = "قم بالتوصيل من الأيباد:\n" +
+                            "اسم الشبكة: $ssid\n" +
+                            "كلمة السر: $password\n\n" +
+                            "افتح Safari واكتب أحد العناوين:\n$ips"
+                }
+
+                override fun onFailed(reason: Int) {
+                    super.onFailed(reason)
+                    statusText.text = "فشل تشغيل الشبكة: $reason"
+                }
+            }, null)
+        } catch (e: SecurityException) {
+            statusText.text = "الحالة: الإذن مرفوض - فعّل الموقع وامنح الأذونات"
+        }
     }
 
     private fun startWebServer() {
         try {
-            webServer = LocalServer(8080)
-            webServer?.start()
+            if (webServer == null) {
+                webServer = LocalServer(8080)
+                webServer?.start()
+            }
         } catch (e: IOException) {
             e.printStackTrace()
         }
@@ -116,7 +156,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     class LocalServer(port: Int) : NanoHTTPD(port) {
-        override fun serve(session: NanoHTTPD.IHTTPSession?): NanoHTTPD.Response {
+        override fun serve(session: IHTTPSession?): Response {
             val html = """
                 <!DOCTYPE html>
                 <html lang="ar" dir="rtl">
@@ -140,7 +180,7 @@ class MainActivity : AppCompatActivity() {
                 </body>
                 </html>
             """.trimIndent()
-            return newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "text/html; charset=utf-8", html)
+            return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
         }
     }
 }

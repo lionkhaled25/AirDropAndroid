@@ -18,10 +18,18 @@ allprojects {
         google()
         mavenCentral()
     }
-}"""
+}
+"""
 
 files["settings.gradle"] = """rootProject.name = "AirDropAndroid"
-include ':app'"""
+include ':app'
+"""
+
+# FIX: هذا الملف كان ناقص - من غيره يفشل البناء بسبب AndroidX
+files["gradle.properties"] = """org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+"""
 
 files["app/build.gradle"] = """plugins {
     id 'com.android.application'
@@ -58,17 +66,21 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
-    implementation 'fi.iki.elonen:nanohttpd:2.3.1'
-}"""
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+}
+"""
 
+# FIX: الـ namespace كان غلط (manifest/android بدل apk/res/android)
 files["app/src/main/AndroidManifest.xml"] = """<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/manifest/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <application
         android:allowBackup="true"
@@ -85,7 +97,8 @@ files["app/src/main/AndroidManifest.xml"] = """<?xml version="1.0" encoding="utf
         </activity>
     </application>
 
-</manifest>"""
+</manifest>
+"""
 
 files["app/src/main/java/com/example/airdropandroid/MainActivity.kt"] = r'''package com.example.airdropandroid
 
@@ -96,11 +109,14 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import fi.iki.elonen.NanoHTTPD
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 class MainActivity : AppCompatActivity() {
 
@@ -113,8 +129,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val layout = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(60, 60, 60, 60)
         }
 
@@ -123,7 +139,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 20f
         }
         infoText = TextView(this).apply {
-            text = "اضغط على الزر لإنشاء شبكة الواي فاي المحلية للسيرفر."
+            text = "اضغط على الزر لإنشاء شبكة الواي فاي المحلية للسيرفر.\n(لازم تكون خدمة الموقع GPS شغالة)"
             textSize = 16f
             setPadding(0, 30, 0, 30)
         }
@@ -148,51 +164,88 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
-        val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        val missing = permissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
         if (missing.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun readCredentials(r: WifiManager.LocalOnlyHotspotReservation?): Pair<String, String> {
+        if (r == null) return Pair("Unknown", "Unknown")
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val c = r.softApConfiguration
+            Pair(c.ssid ?: "Unknown", c.passphrase ?: "Unknown")
+        } else {
+            val c = r.wifiConfiguration
+            Pair(c?.SSID ?: "Unknown", c?.preSharedKey ?: "Unknown")
+        }
+    }
+
+    // عنوان الـ IP الحقيقي للهوتسبوت مش دايماً 192.168.43.1
+    private fun getLocalIps(): List<String> {
+        val result = mutableListOf<String>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return result
+            for (ni in interfaces) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (addr in ni.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        addr.hostAddress?.let { result.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return result
+    }
+
     private fun startHotspotAndServer() {
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             statusText.text = "الحالة: يرجى منح إذن الموقع أولاً"
+            checkPermissions()
             return
         }
 
-        wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
-            override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation?) {
-                super.onStarted(reservation)
-                hotspotReservation = reservation
-                val ssid = reservation?.wifiConfiguration?.SSID ?: "Unknown"
-                val password = reservation?.wifiConfiguration?.preSharedKey ?: "Unknown"
+        try {
+            wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
+                override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation?) {
+                    super.onStarted(reservation)
+                    hotspotReservation = reservation
+                    val (ssid, password) = readCredentials(reservation)
 
-                startWebServer()
+                    startWebServer()
 
-                statusText.text = "الحالة: شغال بنجاح! 🚀"
-                infoText.text = """
-                    قم بالتوصيل من الأيباد:
-                    اسم الشبكة: $ssid
-                    كلمة السر: $password
-                    
-                    افتح Safari واكتب العنوان:
-                    http://192.168.43.1:8080
-                """.trimIndent()
-            }
+                    val ips = getLocalIps().joinToString("\n") { "http://$it:8080" }
 
-            override fun onFailed(reason: Int) {
-                super.onFailed(reason)
-                statusText.text = "فشل تشغيل الشبكة: $reason"
-            }
-        }, null)
+                    statusText.text = "الحالة: شغال بنجاح! 🚀"
+                    infoText.text = "قم بالتوصيل من الأيباد:\n" +
+                            "اسم الشبكة: $ssid\n" +
+                            "كلمة السر: $password\n\n" +
+                            "افتح Safari واكتب أحد العناوين:\n$ips"
+                }
+
+                override fun onFailed(reason: Int) {
+                    super.onFailed(reason)
+                    statusText.text = "فشل تشغيل الشبكة: $reason"
+                }
+            }, null)
+        } catch (e: SecurityException) {
+            statusText.text = "الحالة: الإذن مرفوض - فعّل الموقع وامنح الأذونات"
+        }
     }
 
     private fun startWebServer() {
         try {
-            webServer = LocalServer(8080)
-            webServer?.start()
+            if (webServer == null) {
+                webServer = LocalServer(8080)
+                webServer?.start()
+            }
         } catch (e: IOException) {
             e.printStackTrace()
         }
@@ -205,7 +258,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     class LocalServer(port: Int) : NanoHTTPD(port) {
-        override fun serve(session: NanoHTTPD.IHTTPSession?): NanoHTTPD.Response {
+        override fun serve(session: IHTTPSession?): Response {
             val html = """
                 <!DOCTYPE html>
                 <html lang="ar" dir="rtl">
@@ -229,11 +282,13 @@ class MainActivity : AppCompatActivity() {
                 </body>
                 </html>
             """.trimIndent()
-            return newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "text/html; charset=utf-8", html)
+            return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
         }
     }
-}'''
+}
+'''
 
+# FIX: المشروع مفيهوش gradle wrapper، فنحدد نسخة Gradle متوافقة مع AGP 8.2.2
 files[".github/workflows/build.yml"] = """name: Build Android APK
 
 on:
@@ -255,8 +310,10 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Setup Gradle
+    - name: Setup Gradle 8.5
       uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.5'
 
     - name: Build Debug APK
       run: gradle assembleDebug --stacktrace
@@ -265,7 +322,8 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: AirDrop-Android-APK
-        path: app/build/outputs/apk/debug/app-debug.apk"""
+        path: app/build/outputs/apk/debug/app-debug.apk
+"""
 
 for path, content in files.items():
     dir_name = os.path.dirname(path)
