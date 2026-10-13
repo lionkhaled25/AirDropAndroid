@@ -116,7 +116,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     class LocalServer(port: Int) : NanoHTTPD(port) {
-        override fun serve(session: IHTTPSession?): Response {
+        override fun serve(session: NanoHTTPD.IHTTPSession?): NanoHTTPD.Response {
             val html = """
                 <!DOCTYPE html>
                 <html lang="ar" dir="rtl">
@@ -140,7 +140,7 @@ class MainActivity : AppCompatActivity() {
                 </body>
                 </html>
             """.trimIndent()
-            return newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
+            return newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "text/html; charset=utf-8", html)
         }
     }
 }
